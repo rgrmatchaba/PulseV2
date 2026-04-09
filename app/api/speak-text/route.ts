@@ -7,7 +7,7 @@ export async function POST(req: NextRequest) {
 
   const audioBuffer = await speak(text);
 
-  return new NextResponse(audioBuffer, {
+  return new NextResponse(new Uint8Array(audioBuffer), {
     headers: {
       "Content-Type": "audio/wav",
       "Content-Length": audioBuffer.length.toString(),
