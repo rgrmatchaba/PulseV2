@@ -1,11 +1,13 @@
 import { Groq } from "groq-sdk";
 import { NextResponse } from "next/server";
 
-const groqClient = new Groq({
-  apiKey: process.env.GROQ_API_KEY,
-});
+export const dynamic = "force-dynamic";
 
 export async function GET() {
+  const groqClient = new Groq({
+    apiKey: process.env.GROQ_API_KEY,
+  });
+
   const message = await groqClient.chat.completions.create({
     model: "llama-3.3-70b-versatile",
     max_tokens: 256,
