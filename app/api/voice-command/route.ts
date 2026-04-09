@@ -188,16 +188,19 @@ Jira project key: ${process.env.JIRA_PROJECT_KEY} | Board ID: ${process.env.JIRA
 
 const GITHUB_ALLOWED = [
   "list_issues",
-  "get_issue",
-  "create_issue",
+  "issue_read",
+  "issue_write",
   "list_pull_requests",
-  "get_pull_request",
+  "pull_request_read",
+  "add_issue_comment",        // also handles PR comments — pass PR number as issue_number
+  "add_reply_to_pull_request_comment",
   "list_commits",
   "get_commit",
   "list_branches",
   "get_file_contents",
   "search_code",
   "search_repositories",
+  "search_pull_requests",
 ];
 
 async function executeGithub(transcript: string): Promise<string> {
