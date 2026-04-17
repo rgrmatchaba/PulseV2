@@ -61,6 +61,17 @@ type VoiceState = "idle" | "recording" | "processing";
 type VoiceRoute = "jira" | "github" | "clarify" | "irrelevant" | "error" | null;
 interface ContextMessage { role: "user" | "assistant"; content: string }
 
+// ── Audio playback helper ─────────────────────────────────────────────────────
+
+async function streamAudio(response: Response): Promise<HTMLAudioElement> {
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const audio = new Audio(url);
+  audio.addEventListener("ended", () => URL.revokeObjectURL(url));
+  audio.play().catch(console.error);
+  return audio;
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function timeAgo(dateStr?: string): string {
@@ -129,16 +140,12 @@ export default function PulseDashboard() {
     setTranscript("Generating briefing...");
     try {
       const res = await fetch("/api/speak");
-      const blob = await res.blob();
-      const url = URL.createObjectURL(blob);
-      const audio = new Audio(url);
+      const audio = await streamAudio(res);
       audioRef.current = audio;
-      audio.onended = () => {
+      audio.addEventListener("ended", () => {
         setBriefingPlaying(false);
         setTranscript("Briefing complete. Tap mic to respond.");
-        URL.revokeObjectURL(url);
-      };
-      audio.play();
+      });
       setTranscript("Playing briefing...");
     } catch (e) {
       setError(String(e));
@@ -150,7 +157,13 @@ export default function PulseDashboard() {
   // ── Start recording ────────────────────────────────────────────────────────
   async function startRecording() {
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+        },
+      });
       const recorder = new MediaRecorder(stream, { mimeType: "audio/webm" });
       chunksRef.current = [];
 
@@ -200,17 +213,13 @@ export default function PulseDashboard() {
             setVoiceContext([]);
           }
 
-          // Step 3 — speak the reply back via Deepgram TTS
+          // Step 3 — stream the reply via Deepgram TTS (starts playing on first chunk)
           const speakRes = await fetch("/api/speak-text", {
             method: "POST",
             headers: { "content-type": "application/json" },
             body: JSON.stringify({ text: reply }),
           });
-          const audioBlob = await speakRes.blob();
-          const url = URL.createObjectURL(audioBlob);
-          const audio = new Audio(url);
-          audio.play();
-          audio.onended = () => URL.revokeObjectURL(url);
+          await streamAudio(speakRes);
 
           setTranscript(`"${t}"\n\n→ ${reply}`);
         } catch (e) {
