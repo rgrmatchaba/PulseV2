@@ -290,7 +290,7 @@ export async function POST(req: NextRequest) {
     routing = await routeIntent(transcript, context);
   } catch (err) {
     console.error("router error:", err);
-    return NextResponse.json({ reply: "My brain just glitched. Try again.", route: "error" });
+    return NextResponse.json({ reply: "My brain just glitched on that one. Give it to me again.", route: "error" });
   }
 
   if (routing.route === "irrelevant") {
@@ -299,7 +299,7 @@ export async function POST(req: NextRequest) {
 
   if (routing.route === "clarify") {
     return NextResponse.json({
-      reply: routing.question ?? "Is this about Jira or GitHub?",
+      reply: routing.question ?? "Hold up — is this about Jira or GitHub? I need you to be specific.",
       route: "clarify",
     });
   }
@@ -313,6 +313,6 @@ export async function POST(req: NextRequest) {
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("voice-command error:", message);
-    return NextResponse.json({ reply: `Command failed: ${message}`, route: "error" });
+    return NextResponse.json({ reply: `That command went sideways on me: ${message}. Try again.`, route: "error" });
   }
 }

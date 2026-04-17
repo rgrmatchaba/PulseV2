@@ -24,9 +24,16 @@ export async function POST(req: NextRequest) {
     const result = await deepgram.listen.v1.media.transcribeFile(
       { data: audioBuffer, contentType },
       {
-        model: "nova-2",
+        model: "nova-3",
         smart_format: true,
+        punctuate: true,
         language: "en",
+        // Hint domain-specific terms so the model doesn't mishear them
+        keyterm: [
+          "Jira", "GitHub", "sprint", "pull request", "PR",
+          "repo", "commit", "issue", "ticket", "branch",
+          "backlog", "in progress", "done", "blocked",
+        ],
       }
     );
 

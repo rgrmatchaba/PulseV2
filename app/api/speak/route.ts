@@ -95,12 +95,10 @@ Read out each commit message. Then briefly cover issues and PRs.`,
 
   // Step 3: TTS
   const audioBuffer = await speak(briefingText);
-  const body = new Uint8Array(audioBuffer);
 
-  return new NextResponse(body, {
+  return new NextResponse(new Uint8Array(audioBuffer), {
     headers: {
-      "Content-Type": "audio/wav",
-      "Content-Length": body.byteLength.toString(),
+      "Content-Type": "audio/mpeg",
     },
   });
 }
