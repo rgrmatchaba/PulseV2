@@ -2,83 +2,172 @@ import Groq from "groq-sdk";
 import { NextRequest, NextResponse } from "next/server";
 import { createAtlassianMCPClient, createGitHubMCPClient } from "@/lib/mcp-client";
 import { executeMCPTool } from "@/lib/mcp-executor";
-import { createGroqChatCompletion, toolCallingSystemMessage } from "@/lib/groq-tool-chat";
+import { pulseToolAgentSystemMessages } from "@/lib/groq-tool-chat";
+import {
+  PULSE_SLJ_ERRORS,
+  pulseGitHubExecutorSystem,
+  pulseJiraExecutorSystem,
+} from "@/lib/pulse-persona";
+import { sanitizeSpokenReply, stripModelThinking } from "@/lib/spoken-reply";
+import { executeJiraComment, executeJiraTransition } from "@/lib/jira-voice-actions";
+import { executeCrossPlatformSummary } from "@/lib/voice-cross-platform";
+import {
+  buildTransitionBlob,
+  extractJiraIssueKey,
+  extractTicketDescriptionHint,
+  looksLikeJiraTransitionRequest,
+  userWantsJiraComment,
+  validateGithubMutatingTool,
+  validateJiraMutatingTool,
+} from "@/lib/task-requirements";
+import {
+  inferSessionRoute,
+  taskStillNeedsUserInput,
+  trimVoiceContext,
+  type SessionRoute,
+  type VoiceContextMessage,
+} from "@/lib/voice-session";
+import { runVoiceToolAgent } from "@/lib/voice-tool-agent";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-// ── Types ─────────────────────────────────────────────────────────────────────
-
-type Route = "jira" | "github" | "irrelevant" | "clarify";
+type Route = "jira" | "github" | "both" | "irrelevant" | "clarify";
 interface RouterResult { route: Route; question?: string }
-type ContextMessage = { role: "user" | "assistant"; content: string };
 
-// ── Layer 1: Intent Router (fast light model) ─────────────────────────────────
+function wantsCrossPlatform(transcript: string): boolean {
+  if (looksLikeJiraTransitionRequest(transcript)) return false;
 
-async function routeIntent(
+  const t = transcript.toLowerCase();
+  const hasJira = /jira|ticket|sprint|board|pwp-/i.test(t);
+  const hasGitHub = /github|pull request|\bpr\b|commit|repo/i.test(t);
+  if (hasJira && hasGitHub) return true;
+
+  const wantsSummary =
+    /summary|overview|standup|briefing|what.+going on|how.+relate|align/i.test(t);
+  return wantsSummary && hasJira && hasGitHub;
+}
+
+function buildExecutorMessages(
+  system: ReturnType<typeof pulseToolAgentSystemMessages>,
+  context: VoiceContextMessage[],
+  transcript: string
+): Groq.Chat.ChatCompletionMessageParam[] {
+  const history = trimVoiceContext(context).map((m) => ({
+    role: m.role as "user" | "assistant",
+    content: m.content,
+  }));
+  return [...system, ...history, { role: "user", content: transcript }];
+}
+
+async function routeContinuation(
   transcript: string,
-  context: ContextMessage[]
+  context: VoiceContextMessage[],
+  sessionRoute: SessionRoute
 ): Promise<RouterResult> {
+  const inferred = inferSessionRoute(context, sessionRoute);
+  if (inferred) return { route: inferred };
+
   const res = await groq.chat.completions.create({
-    model: "qwen/qwen3-32b",
+    model: "llama-3.3-70b-versatile",
     temperature: 0,
     messages: [
       {
         role: "system",
-        content: `You are an intent router for Pulse, a developer co-pilot that controls Jira and GitHub.
+        content: `Continue an in-progress Pulse voice task. Pick the route for THIS user reply:
+- "jira" | "github" | "both" | "irrelevant"
+Do NOT output "clarify" — the executor will ask questions if needed.
 
-Classify the user's request as exactly one of:
-- "jira"      → Jira tickets, sprints, issues, boards, comments, transitions, priorities
-- "github"    → GitHub repos, pull requests, commits, branches, code search, GitHub issues
-- "irrelevant"→ anything NOT related to Jira or GitHub (weather, food, general chat, etc.)
-- "clarify"   → genuinely ambiguous between Jira and GitHub — ask one focused question
-
-Use the prior conversation context (if any) to help resolve ambiguous follow-ups.
-
-Reply with ONLY valid JSON, no extra text:
-{"route":"jira"|"github"|"irrelevant"|"clarify","question":"your question here — only set if route=clarify"}`,
+Reply ONLY JSON: {"route":"jira"|"github"|"both"|"irrelevant"}`,
       },
-      ...context.map((m) => ({ role: m.role, content: m.content })),
+      ...trimVoiceContext(context).map((m) => ({
+        role: m.role as "user" | "assistant",
+        content: m.content,
+      })),
       { role: "user", content: transcript },
     ],
   });
 
   try {
-    let text = (res.choices[0].message.content ?? "{}").trim();
-    // Qwen3 prepends <think>...</think> reasoning blocks — strip them before parsing
-    text = text.replace(/<think>[\s\S]*?<\/think>/gi, "").trim();
-    // Strip markdown fences
-    text = text.replace(/```(?:json)?\s*/g, "").replace(/```/g, "").trim();
-    // Extract the first JSON object in case the model adds surrounding prose
+    let text = stripModelThinking(res.choices[0].message.content ?? "{}");
     const match = text.match(/\{[\s\S]*\}/);
-    return JSON.parse(match?.[0] ?? text) as RouterResult;
+    const parsed = JSON.parse(match?.[0] ?? text) as { route: Route };
+    if (parsed.route === "jira" || parsed.route === "github" || parsed.route === "both") {
+      return { route: parsed.route };
+    }
   } catch {
-    return { route: "clarify", question: "Can you clarify — is this about Jira or GitHub?" };
+    /* fall through */
+  }
+  return { route: "jira" };
+}
+
+async function routeIntent(
+  transcript: string,
+  context: VoiceContextMessage[],
+  sessionRoute: SessionRoute
+): Promise<RouterResult> {
+  if (context.length > 0) {
+    return routeContinuation(transcript, context, sessionRoute);
+  }
+
+  const jiraOnlyAction =
+    (looksLikeJiraTransitionRequest(transcript) || userWantsJiraComment(transcript)) &&
+    !/github|pull request|\bpr\b|commit|repo/i.test(transcript.toLowerCase());
+  if (jiraOnlyAction) {
+    return { route: "jira" };
+  }
+
+  if (wantsCrossPlatform(transcript)) {
+    return { route: "both" };
+  }
+
+  const res = await groq.chat.completions.create({
+    model: "llama-3.3-70b-versatile",
+    temperature: 0,
+    messages: [
+      {
+        role: "system",
+        content: `You are an intent router for Pulse, a developer co-pilot for Jira and GitHub.
+
+Classify the user's request as exactly one of:
+- "both"      → needs Jira AND GitHub together: summary, overview, status, standup, how tickets relate to PRs/commits
+- "jira"      → Jira-only: tickets, sprints, boards, transitions, comments
+- "github"    → GitHub-only: PRs, commits, branches, repo issues
+- "irrelevant"→ NOT about Jira or GitHub
+- "clarify"   → ONLY if truly one platform and ambiguous — NOT when user wants both or a combined summary
+
+If the user mentions Jira and GitHub in one request, route "both".
+
+Reply with ONLY valid JSON:
+{"route":"jira"|"github"|"both"|"irrelevant"|"clarify","question":"only if clarify"}`,
+      },
+      { role: "user", content: transcript },
+    ],
+  });
+
+  try {
+    let text = stripModelThinking(res.choices[0].message.content ?? "{}");
+    text = text.replace(/```(?:json)?\s*/g, "").replace(/```/g, "").trim();
+    const match = text.match(/\{[\s\S]*\}/);
+    const parsed = JSON.parse(match?.[0] ?? text) as RouterResult;
+    if (parsed.route === "clarify" && wantsCrossPlatform(transcript)) {
+      return { route: "both" };
+    }
+    return parsed;
+  } catch {
+    return wantsCrossPlatform(transcript)
+      ? { route: "both" }
+      : { route: "clarify", question: PULSE_SLJ_ERRORS.clarifyDefault };
   }
 }
 
 const FRUSTRATED = [
   "Man, what the hell are you talking about? I deal with Jira and GitHub. That's the whole menu. Pick one.",
   "That ain't got a damn thing to do with your sprint or your repo. Ask me something I can actually use.",
-  "Are you serious right now? I'm a developer co-pilot. Jira. GitHub. That's it. That's the list.",
-  "I don't know what you're on about, but it sure ain't a ticket or a pull request. Stay in your lane.",
-  "Wrong tool, wrong question. I do Jira and GitHub. Come back when you've got something relevant.",
-  "English, do you speak it?! Because what you just said has nothing to do with code, tickets, or repos.",
-  "I'm gonna need you to take that question, walk it over to Google, and leave me alone. I do Jira and GitHub.",
-  "Oh hell no. You did not just ask me that. I am a developer co-pilot, not your therapist. Jira. GitHub. That's my world.",
-  "Look, I like you. But that question? That question is dead to me. Come back with a ticket number or a repo.",
-  "You know what? I've been through too much to deal with this. Ask me about a sprint, a PR, anything. Just not... that.",
-  "My name is Pulse. I live in the terminal. I breathe YAML. I don't do whatever this is. Try again.",
-  "I am very serious about Jira and GitHub, and I will not stand here and be disrespected with off-topic questions.",
-  "Does this look like Stack Overflow to you? Does this look like ChatGPT? Ask me about your tickets. NOW.",
-  "Zero. That's how many damns I give about that question. Jira or GitHub — those are your two options, friend.",
-  "You better check yourself before you wreck yourself — and by wreck, I mean waste both our time again with that nonsense.",
 ];
 
 function frustrated(): string {
   return FRUSTRATED[Math.floor(Math.random() * FRUSTRATED.length)];
 }
-
-// ── Schema helpers ────────────────────────────────────────────────────────────
 
 function trimSchema(raw: Record<string, unknown>): Record<string, unknown> {
   const props = raw.properties as Record<string, Record<string, unknown>> | undefined;
@@ -91,7 +180,21 @@ function trimSchema(raw: Record<string, unknown>): Record<string, unknown> {
   return { ...raw, properties: trimmed };
 }
 
-// ── Layer 2a: Jira executor ───────────────────────────────────────────────────
+function jsonResponse(
+  reply: string,
+  route: Route | "error",
+  taskActive: boolean,
+  sessionRoute: SessionRoute
+) {
+  return NextResponse.json({
+    reply: sanitizeSpokenReply(reply, {
+      maxChars: route === "both" ? 400 : taskActive ? 160 : 280,
+    }),
+    route,
+    taskActive,
+    sessionRoute: taskActive ? sessionRoute : null,
+  });
+}
 
 const JIRA_ALLOWED = [
   "jira_get_issue",
@@ -105,7 +208,38 @@ const JIRA_ALLOWED = [
 ];
 const LIMIT_INJECTED = new Set(["jira_search", "jira_get_sprint_issues"]);
 
-async function executeJira(transcript: string): Promise<string> {
+async function executeJira(
+  transcript: string,
+  context: VoiceContextMessage[]
+): Promise<{ reply: string; taskActive: boolean }> {
+  const projectKey = process.env.JIRA_PROJECT_KEY ?? "";
+  const boardId = process.env.JIRA_BOARD_ID ?? "";
+  const blob = buildTransitionBlob(context, transcript);
+  const transitionOnly =
+    looksLikeJiraTransitionRequest(blob) && !userWantsJiraComment(blob);
+
+  // Jira mutations via REST — Atlassian MCP no longer exposes jira_* tools on this site.
+  const transitionResult = await executeJiraTransition(
+    context,
+    transcript,
+    projectKey,
+    boardId
+  );
+  if (transitionResult) return transitionResult;
+
+  if (transitionOnly) {
+    const hint = extractTicketDescriptionHint(blob);
+    return {
+      reply: hint
+        ? `Couldn't match that ticket in the sprint. Say the key — like PWP dash 1.`
+        : `I heard you want to move a ticket — which issue key? Say PWP dash 1 or PWP-1.`,
+      taskActive: true,
+    };
+  }
+
+  const commentResult = await executeJiraComment(context, transcript, projectKey);
+  if (commentResult) return commentResult;
+
   const client = await createAtlassianMCPClient();
   const { tools: mcpTools } = await client.listTools();
 
@@ -128,63 +262,66 @@ async function executeJira(transcript: string): Promise<string> {
       };
     });
 
-  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
-    toolCallingSystemMessage(),
-    {
-      role: "system",
-      content: `You are Pulse, a voice-powered Jira executor with the directness of Samuel L. Jackson.
-Jira project key: ${process.env.JIRA_PROJECT_KEY} | Board ID: ${process.env.JIRA_BOARD_ID}
-- Call the appropriate Jira tool to fulfil the request
-- If transitioning an issue, first call jira_get_transitions to get valid transition IDs
-- Respond in 1-2 sentences confirming what you did or found. Keep the SLJ energy.`,
-    },
-    { role: "user", content: transcript },
-  ];
-
-  try {
-    while (true) {
-      const response = await createGroqChatCompletion(groq, {
-        model: "qwen/qwen3-32b",
-        messages,
-        tools: groqTools,
-        tool_choice: "auto",
-      });
-
-      const choice = response.choices[0];
-      if (choice.finish_reason === "stop" || !choice.message.tool_calls?.length) {
-        await client.close();
-        return choice.message.content ?? "Done.";
-      }
-
-      messages.push(choice.message);
-
-      for (const toolCall of choice.message.tool_calls) {
-        let args: Record<string, unknown>;
-        try {
-          args = typeof toolCall.function.arguments === "string"
-            ? JSON.parse(toolCall.function.arguments)
-            : toolCall.function.arguments;
-        } catch { args = {}; }
-
-        if (toolCall.function.name === "jira_search")
-          args.limit = Math.min(parseInt(String(args.limit || 10), 10) || 10, 50);
-        if (toolCall.function.name === "jira_get_sprint_issues")
-          args.limit = Math.min(parseInt(String(args.limit || 15), 10) || 15, 50);
-        if (toolCall.function.name === "jira_get_sprints_from_board" && args.board_id !== undefined)
-          args.board_id = String(args.board_id);
-
-        const result = await executeMCPTool(client, toolCall.function.name, args);
-        const truncated = result.length > 8000 ? result.slice(0, 8000) + "\n...[truncated]" : result;
-        messages.push({ role: "tool", tool_call_id: toolCall.id, content: truncated });
-      }
-    }
-  } catch (err) {
+  if (groqTools.length === 0) {
     await client.close().catch(() => {});
-    throw err;
+    console.warn(
+      "[Pulse] No jira_* MCP tools available — only Teamwork Graph tools. Use REST for transitions/comments."
+    );
+    const blob = [...context, { role: "user", content: transcript }]
+      .map((m) => m.content)
+      .join(" ");
+    if (looksLikeJiraTransitionRequest(blob)) {
+      const key = extractJiraIssueKey(blob, projectKey);
+      if (!key) {
+        return {
+          reply:
+            "I heard you want to move a ticket — which issue key? Say PWP dash 4 or PWP-4.",
+          taskActive: true,
+        };
+      }
+      return {
+        reply: `I got ${key} but couldn't run the transition — try again: move ${key} to done.`,
+        taskActive: true,
+      };
+    }
+    return {
+      reply:
+        "I can transition tickets and add comments on Jira — say something like move PWP-4 to done, or add a comment on PWP-4. General Jira search on the dashboard already uses the API.",
+      taskActive: false,
+    };
   }
-}
 
-// ── Layer 2b: GitHub executor ─────────────────────────────────────────────────
+  const messages = buildExecutorMessages(
+    pulseToolAgentSystemMessages(
+      pulseJiraExecutorSystem(projectKey, process.env.JIRA_BOARD_ID ?? "")
+    ),
+    context,
+    transcript
+  );
+
+  const { reply } = await runVoiceToolAgent(
+    groq,
+    messages,
+    groqTools,
+    async (name, args) => {
+      if (name === "jira_search")
+        args.limit = Math.min(parseInt(String(args.limit || 10), 10) || 10, 50);
+      if (name === "jira_get_sprint_issues")
+        args.limit = Math.min(parseInt(String(args.limit || 15), 10) || 15, 50);
+      if (name === "jira_get_sprints_from_board" && args.board_id !== undefined)
+        args.board_id = String(args.board_id);
+      return executeMCPTool(client, name, args);
+    },
+    () => client.close().catch(() => {}),
+    320,
+    (name, args) => validateJiraMutatingTool(name, args, context, transcript)
+  );
+
+  return {
+    reply,
+    taskActive: taskStillNeedsUserInput(reply, context, transcript),
+  };
+}
 
 const GITHUB_ALLOWED = [
   "list_issues",
@@ -192,7 +329,7 @@ const GITHUB_ALLOWED = [
   "issue_write",
   "list_pull_requests",
   "pull_request_read",
-  "add_issue_comment",        // also handles PR comments — pass PR number as issue_number
+  "add_issue_comment",
   "add_reply_to_pull_request_comment",
   "list_commits",
   "get_commit",
@@ -203,7 +340,10 @@ const GITHUB_ALLOWED = [
   "search_pull_requests",
 ];
 
-async function executeGithub(transcript: string): Promise<string> {
+async function executeGithub(
+  transcript: string,
+  context: VoiceContextMessage[]
+): Promise<{ reply: string; taskActive: boolean }> {
   const client = await createGitHubMCPClient();
   const { tools: mcpTools } = await client.listTools();
 
@@ -218,64 +358,43 @@ async function executeGithub(transcript: string): Promise<string> {
       },
     }));
 
-  const messages: Groq.Chat.ChatCompletionMessageParam[] = [
-    toolCallingSystemMessage(),
-    {
-      role: "system",
-      content: `You are Pulse, a voice-powered GitHub executor with the directness of Samuel L. Jackson.
-Default repo: ${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}
-- Call the appropriate GitHub tool to fulfil the request
-- Respond in 1-2 sentences confirming what you found or did. Keep the SLJ energy.`,
-    },
-    { role: "user", content: transcript },
-  ];
+  const messages = buildExecutorMessages(
+    pulseToolAgentSystemMessages(
+      pulseGitHubExecutorSystem(
+        process.env.GITHUB_OWNER ?? "",
+        process.env.GITHUB_REPO ?? ""
+      )
+    ),
+    context,
+    transcript
+  );
 
-  try {
-    while (true) {
-      const response = await createGroqChatCompletion(groq, {
-        model: "qwen/qwen3-32b",
-        messages,
-        tools: groqTools,
-        tool_choice: "auto",
-      });
+  const { reply } = await runVoiceToolAgent(
+    groq,
+    messages,
+    groqTools,
+    (name, args) => executeMCPTool(client, name, args),
+    () => client.close().catch(() => {}),
+    320,
+    (name, args) => validateGithubMutatingTool(name, args, context, transcript)
+  );
 
-      const choice = response.choices[0];
-      if (choice.finish_reason === "stop" || !choice.message.tool_calls?.length) {
-        await client.close();
-        return choice.message.content ?? "Done.";
-      }
-
-      messages.push(choice.message);
-
-      for (const toolCall of choice.message.tool_calls) {
-        let args: Record<string, unknown>;
-        try {
-          args = typeof toolCall.function.arguments === "string"
-            ? JSON.parse(toolCall.function.arguments)
-            : toolCall.function.arguments;
-        } catch { args = {}; }
-
-        const result = await executeMCPTool(client, toolCall.function.name, args);
-        const truncated = result.length > 8000 ? result.slice(0, 8000) + "\n...[truncated]" : result;
-        messages.push({ role: "tool", tool_call_id: toolCall.id, content: truncated });
-      }
-    }
-  } catch (err) {
-    await client.close().catch(() => {});
-    throw err;
-  }
+  return {
+    reply,
+    taskActive: taskStillNeedsUserInput(reply, context, transcript),
+  };
 }
-
-// ── Route handler ─────────────────────────────────────────────────────────────
 
 export async function POST(req: NextRequest) {
   let transcript: string;
-  let context: ContextMessage[] = [];
+  let context: VoiceContextMessage[] = [];
+  let sessionRoute: SessionRoute = null;
 
   try {
     const body = await req.json();
     transcript = body.transcript;
     context = Array.isArray(body.context) ? body.context : [];
+    sessionRoute = body.sessionRoute ?? null;
   } catch {
     return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
   }
@@ -284,35 +403,47 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ error: "No transcript provided" }, { status: 400 });
   }
 
-  // Layer 1 — route intent
+  context = trimVoiceContext(context);
+
   let routing: RouterResult;
   try {
-    routing = await routeIntent(transcript, context);
+    routing = await routeIntent(transcript, context, sessionRoute);
   } catch (err) {
     console.error("router error:", err);
-    return NextResponse.json({ reply: "My brain just glitched. Try again.", route: "error" });
+    return jsonResponse(PULSE_SLJ_ERRORS.routerGlitch, "error", false, null);
   }
 
   if (routing.route === "irrelevant") {
-    return NextResponse.json({ reply: frustrated(), route: "irrelevant" });
+    return jsonResponse(frustrated(), "irrelevant", false, null);
   }
+
+  const activeSessionRoute: SessionRoute =
+    routing.route === "jira" || routing.route === "github" || routing.route === "both"
+      ? routing.route
+      : inferSessionRoute(context, sessionRoute);
 
   if (routing.route === "clarify") {
-    return NextResponse.json({
-      reply: routing.question ?? "Is this about Jira or GitHub?",
-      route: "clarify",
-    });
+    const question = routing.question ?? PULSE_SLJ_ERRORS.clarifyDefault;
+    return jsonResponse(question, "clarify", true, activeSessionRoute ?? "jira");
   }
 
-  // Layer 2 — execute against the correct MCP
   try {
-    const reply = routing.route === "github"
-      ? await executeGithub(transcript)
-      : await executeJira(transcript);
-    return NextResponse.json({ reply, route: routing.route });
+    if (routing.route === "both") {
+      const rawReply = await executeCrossPlatformSummary(transcript, context);
+      const taskActive = taskStillNeedsUserInput(rawReply, context, transcript);
+      return jsonResponse(rawReply, "both", taskActive, taskActive ? "both" : null);
+    }
+
+    if (routing.route === "github") {
+      const { reply, taskActive } = await executeGithub(transcript, context);
+      return jsonResponse(reply, "github", taskActive, taskActive ? "github" : null);
+    }
+
+    const { reply, taskActive } = await executeJira(transcript, context);
+    return jsonResponse(reply, "jira", taskActive, taskActive ? "jira" : null);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
     console.error("voice-command error:", message);
-    return NextResponse.json({ reply: `Command failed: ${message}`, route: "error" });
+    return jsonResponse(PULSE_SLJ_ERRORS.commandFailed(message), "error", false, null);
   }
 }

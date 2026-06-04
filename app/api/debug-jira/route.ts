@@ -12,6 +12,14 @@ export async function GET() {
     const client = await createAtlassianMCPClient();
     steps.connected = true;
 
+    // List all available tools with full schemas
+    const toolsResult = await client.listTools();
+    steps.availableTools = toolsResult.tools.map((t) => ({
+      name: t.name,
+      description: t.description,
+      inputSchema: t.inputSchema,
+    }));
+
     // Raw sprint response
     const sprintRaw = await executeMCPTool(client, "jira_get_sprints_from_board", {
       board_id: boardId ?? "0",

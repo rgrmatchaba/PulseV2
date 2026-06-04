@@ -3,8 +3,9 @@ import { NextResponse } from "next/server";
 import {
   createGroqChatCompletion,
   GROQ_TOOL_CALLING_MODEL,
-  toolCallingSystemMessage,
+  pulseToolAgentSystemMessages,
 } from "@/lib/groq-tool-chat";
+import { PULSE_SLJ_SHORT_BRIEFING } from "@/lib/pulse-persona";
 import { createGitHubMCPClient } from "@/lib/mcp-client";
 import { executeMCPTool } from "@/lib/mcp-executor";
 
@@ -33,19 +34,17 @@ export async function GET() {
     }));
 
   const messages: Groq.Chat.ChatCompletionMessageParam[] = [
-    toolCallingSystemMessage(),
+    ...pulseToolAgentSystemMessages(PULSE_SLJ_SHORT_BRIEFING),
     {
       role: "user",
-      content: `You are Pulse, a voice-powered engineering co-pilot with the attitude and directness of Samuel L. Jackson — confident, no-nonsense, a little edge, but always professional.
-
-My GitHub repo is: ${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}
+      content: `My GitHub repo is: ${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO}
 
 Do the following:
-1. Fetch the last 10 commits on the main branch, state the commit message and the author of each commit 
+1. Fetch the last 10 commits on the main branch
 2. Fetch any open pull requests
 3. Search for open issues: repo:${process.env.GITHUB_OWNER}/${process.env.GITHUB_REPO} is:open
 
-Then give me a single voice briefing covering all three, state the commit message and the author. Keep it under 120 words. Sound like you mean it.`,
+Then give me a single voice briefing covering all three — summarize activity, do not read every commit message aloud unless something needs my attention.`,
     },
   ];
 

@@ -1,5 +1,6 @@
 import { Groq } from "groq-sdk";
 import { NextResponse } from "next/server";
+import { pulsePersonaSystem } from "@/lib/pulse-persona";
 
 export const dynamic = "force-dynamic";
 
@@ -12,18 +13,16 @@ export async function GET() {
     model: "llama-3.3-70b-versatile",
     max_tokens: 256,
     messages: [
-      {
-        role: "system",
-        content: "You are a helpful assistant that can answer questions and help with tasks. Answer in the tone and manner of Samuel L. Jackson.",
-      },
+      pulsePersonaSystem(),
       {
         role: "user",
-        content: "Say hello as Pulse, a voice-powered engineering co-pilot. One sentence only.",
+        content:
+          "Say hello as Pulse, a voice-powered engineering co-pilot. One sentence only. Samuel L. Jackson / Nick Fury energy.",
       },
     ],
   });
 
-  const text = message.choices[0]?.message.content ?? "";
+  const text = message.choices[0]?.message?.content ?? "";
 
   return NextResponse.json({ message: text });
 }

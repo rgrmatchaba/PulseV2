@@ -2,12 +2,14 @@ import Groq, { APIError } from "groq-sdk";
 import type {
   ChatCompletion,
   ChatCompletionCreateParams,
+  ChatCompletionSystemMessageParam,
 } from "groq-sdk/resources/chat/completions";
+import { pulsePersonaSystem } from "./pulse-persona";
 
 export const GROQ_TOOL_CALLING_MODEL =
   process.env.GROQ_TOOL_MODEL ?? "llama-3.3-70b-versatile";
 
-export function toolCallingSystemMessage(): Groq.Chat.ChatCompletionSystemMessageParam {
+export function toolCallingSystemMessage(): ChatCompletionSystemMessageParam {
   return {
     role: "system",
     content:
@@ -15,6 +17,13 @@ export function toolCallingSystemMessage(): Groq.Chat.ChatCompletionSystemMessag
       "Never output XML tags, <function=...>, or any plain-text pseudo tool syntax. " +
       "Use only the provided function names with JSON arguments matching each tool schema.",
   };
+}
+
+/** Tool-calling agents that speak back to the user — SLJ persona + tool rules. */
+export function pulseToolAgentSystemMessages(
+  domainExtra?: string
+): ChatCompletionSystemMessageParam[] {
+  return [toolCallingSystemMessage(), pulsePersonaSystem(domainExtra)];
 }
 
 function isToolUseFailed(err: unknown): boolean {

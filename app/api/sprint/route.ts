@@ -2,6 +2,8 @@ import Groq from "groq-sdk";
 import { NextResponse } from "next/server";
 import { createAtlassianMCPClient } from "@/lib/mcp-client";
 import { executeMCPTool } from "@/lib/mcp-executor";
+import { pulseToolAgentSystemMessages } from "@/lib/groq-tool-chat";
+import { PULSE_SLJ_SHORT_BRIEFING } from "@/lib/pulse-persona";
 
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
@@ -27,11 +29,10 @@ export async function GET() {
     }));
 
   const messages: Groq.Chat.ChatCompletionMessageParam[] = [
+    ...pulseToolAgentSystemMessages(PULSE_SLJ_SHORT_BRIEFING),
     {
       role: "user",
-      content: `You are Pulse, a voice-powered engineering co-pilot with the attitude and directness of Samuel L. Jackson — confident, no-nonsense, a little edge, always professional.
-
-My Jira board ID is: ${process.env.JIRA_BOARD_ID}
+      content: `My Jira board ID is: ${process.env.JIRA_BOARD_ID}
 My Jira project key is: ${process.env.JIRA_PROJECT_KEY}
 
 Do the following steps in order:
@@ -39,7 +40,7 @@ Do the following steps in order:
 2. Use jira_get_sprint_issues with the sprint ID you just found to get all tickets
 3. Use jira_search with JQL: project = ${process.env.JIRA_PROJECT_KEY} AND updated <= -7d AND statusCategory != Done to find stale tickets
 
-Then give me a concise voice briefing covering: sprint name, tickets in progress, tickets done, and any stale ones. Under 120 words. Sound like you mean it.`,
+Then give me a concise voice briefing covering: sprint name, tickets in progress, tickets done, and any stale ones.`,
     },
   ];
 
